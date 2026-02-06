@@ -67,6 +67,7 @@ class ProvidersConfig(BaseModel):
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
+    custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Custom OpenAI-compatible endpoints
 
 
 class GatewayConfig(BaseModel):
@@ -105,14 +106,14 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    
+
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
-    
+
     def get_api_key(self) -> str | None:
-        """Get API key in priority order: OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > vLLM."""
+        """Get API key in priority order: OpenRouter > DeepSeek > Anthropic > OpenAI > Gemini > Zhipu > Groq > Custom > vLLM."""
         return (
             self.providers.openrouter.api_key or
             self.providers.deepseek.api_key or
@@ -121,20 +122,23 @@ class Config(BaseSettings):
             self.providers.gemini.api_key or
             self.providers.zhipu.api_key or
             self.providers.groq.api_key or
+            self.providers.custom.api_key or
             self.providers.vllm.api_key or
             None
         )
-    
+
     def get_api_base(self) -> str | None:
-        """Get API base URL if using OpenRouter, Zhipu or vLLM."""
+        """Get API base URL if using OpenRouter, Zhipu, Custom or vLLM."""
         if self.providers.openrouter.api_key:
             return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
         if self.providers.zhipu.api_key:
             return self.providers.zhipu.api_base
+        if self.providers.custom.api_key and self.providers.custom.api_base:
+            return self.providers.custom.api_base
         if self.providers.vllm.api_base:
             return self.providers.vllm.api_base
         return None
-    
+
     class Config:
         env_prefix = "NANOBOT_"
         env_nested_delimiter = "__"
