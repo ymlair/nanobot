@@ -170,8 +170,16 @@ class FeishuChannel(BaseChannel):
             else:
                 receive_id_type = "open_id"
             
-            # Build text message content
-            content = json.dumps({"text": msg.content})
+            # Build text message content (mention sender in group when bot is mentioned)
+            message_text = msg.content
+            if (
+                msg.metadata.get("chat_type") == "group"
+                and msg.metadata.get("mentioned") is True
+            ):
+                sender_id = msg.metadata.get("sender_id")
+                if sender_id:
+                    message_text = f'<at user_id="{sender_id}">你</at> {message_text}'
+            content = json.dumps({"text": message_text})
             
             request = CreateMessageRequest.builder() \
                 .receive_id_type(receive_id_type) \
@@ -246,6 +254,22 @@ class FeishuChannel(BaseChannel):
             if not content:
                 return
             
+            # Determine whether the bot was mentioned
+            mentions = getattr(message, "mentions", None)
+            mentioned_open_ids: list[str] = []
+            if mentions:
+                for mention in mentions:
+                    mention_id = getattr(mention, "id", None)
+                    open_id = getattr(mention_id, "open_id", None)
+                    if open_id:
+                        mentioned_open_ids.append(open_id)
+            was_mentioned = bool(mentions)
+            if was_mentioned and mentioned_open_ids:
+                logger.info(
+                    "Feishu mentions open_ids: "
+                    + ", ".join(mentioned_open_ids)
+                )
+
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
             await self._handle_message(
@@ -256,6 +280,8 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
+                    "mentioned": was_mentioned,
+                    "mentioned_open_ids": mentioned_open_ids,
                 }
             )
             
