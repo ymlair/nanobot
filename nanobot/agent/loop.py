@@ -101,6 +101,10 @@ class AgentLoop:
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        
+        # Restart tool (for graceful restart)
+        from nanobot.agent.tools.restart import RestartTool
+        self.tools.register(RestartTool())
     
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
