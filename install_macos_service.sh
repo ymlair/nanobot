@@ -35,6 +35,12 @@ cat > "$PLIST_FILE" << EOF
     <key>WorkingDirectory</key>
     <string>$WORK_DIR</string>
     
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$PATH</string>
+    </dict>
+    
     <key>RunAtLoad</key>
     <true/>
     
