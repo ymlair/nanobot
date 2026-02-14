@@ -61,6 +61,22 @@ cursor-agent -p --force "<你的指令>"
 - `--workspace <path>`: 指定工作目录
 - `--project <name>`: 通过项目名自动查找目录（从 ~/.nanobot/projects.json 读取）
 
+## ⚠️ 执行策略（重要）
+
+cursor-agent 执行时间可能很长（几分钟到十几分钟），**必须使用 spawn 在后台执行**，避免阻塞主 agent：
+
+```
+spawn(
+  task: "使用 exec 工具执行以下命令，注意设置 timeout=0：\n\n exec(command='./scripts/cursor-agent-wrapper.sh \"<指令>\" --project <项目名>', timeout=0)",
+  label: "<简短描述>"
+)
+```
+
+**关键点**：
+- **必须用 spawn**：让任务在后台跑，bot 保持响应
+- **exec 必须传 timeout=0**：cursor-agent 运行时间不可预测，不能有超时限制
+- 完成后 subagent 会自动通知用户结果
+
 ## 📌 注意事项
 
 1. **🚨 强制分支开发规范**：
@@ -82,6 +98,4 @@ cursor-agent -p --force "<你的指令>"
 
 4. 确保 `cursor-agent` 已正确安装
 
-5. 对于大型项目，分析可能需要较长时间
-
-6. 敏感操作前会提示确认
+5. 敏感操作前会提示确认

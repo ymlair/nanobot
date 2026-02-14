@@ -55,16 +55,29 @@ class ExecTool(Tool):
                 "working_dir": {
                     "type": "string",
                     "description": "Optional working directory for the command"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": (
+                        "Override timeout in seconds for this command. "
+                        "Use 0 for no time limit (for long-running tasks like cursor-agent, builds). "
+                        "Omit to use the default timeout."
+                    )
                 }
             },
             "required": ["command"]
         }
     
-    async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
+    async def execute(
+        self, command: str, working_dir: str | None = None, timeout: int | None = None, **kwargs: Any
+    ) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
+        
+        # Per-call timeout overrides instance default; 0 means no limit
+        effective_timeout = timeout if timeout is not None else self.timeout
         
         try:
             process = await asyncio.create_subprocess_shell(
@@ -74,14 +87,18 @@ class ExecTool(Tool):
                 cwd=cwd,
             )
             
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.timeout
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                return f"Error: Command timed out after {self.timeout} seconds"
+            if effective_timeout == 0:
+                # No time limit
+                stdout, stderr = await process.communicate()
+            else:
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=effective_timeout
+                    )
+                except asyncio.TimeoutError:
+                    process.kill()
+                    return f"Error: Command timed out after {effective_timeout} seconds"
             
             output_parts = []
             
