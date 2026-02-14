@@ -8,12 +8,22 @@ PLIST_FILE="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 WORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_PATH=$(which python3)
 LOG_DIR="$HOME/.nanobot/logs"
+ENV_FILE="$HOME/.nanobot/env"
 
 echo "=== Nanobot LaunchAgent 安装脚本 ==="
 echo ""
 
 # 创建日志目录
 mkdir -p "$LOG_DIR"
+
+# 读取可选环境变量文件（用于 LaunchAgent）
+# 示例：在 ~/.nanobot/env 中设置 CURSOR_API_KEY=xxx
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
 
 # 创建 plist 文件
 cat > "$PLIST_FILE" << EOF
@@ -39,6 +49,8 @@ cat > "$PLIST_FILE" << EOF
     <dict>
         <key>PATH</key>
         <string>$PATH</string>
+        <key>CURSOR_API_KEY</key>
+        <string>${CURSOR_API_KEY:-}</string>
     </dict>
     
     <key>RunAtLoad</key>
