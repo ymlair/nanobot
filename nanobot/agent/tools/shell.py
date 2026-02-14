@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
 from nanobot.agent.tools.base import Tool
 
 
@@ -79,6 +80,7 @@ class ExecTool(Tool):
         # Per-call timeout overrides instance default; 0 means no limit
         effective_timeout = timeout if timeout is not None else self.timeout
         
+        process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
@@ -121,6 +123,17 @@ class ExecTool(Tool):
                 result = result[:max_len] + f"\n... (truncated, {len(result) - max_len} more chars)"
             
             return result
+        
+        except asyncio.CancelledError:
+            # Task was cancelled (user requested stop) — kill the subprocess
+            if process is not None:
+                logger.info(f"Killing subprocess for cancelled command: {command[:80]}")
+                try:
+                    process.kill()
+                    await process.wait()
+                except ProcessLookupError:
+                    pass  # Already exited
+            raise  # Re-raise so cancellation propagates
             
         except Exception as e:
             return f"Error executing command: {str(e)}"

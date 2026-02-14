@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,16 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
+
+# Busy reply cooldown per chat: avoid spamming "I'm busy" for every message
+_BUSY_REPLY_COOLDOWN = 15  # seconds
+
+# Keywords that indicate the user wants to cancel the current task
+_CANCEL_KEYWORDS = [
+    "停止", "取消", "算了", "停下", "别做了", "不用了", "不要了",
+    "中断", "打断", "别干了", "停一下", "别搞了",
+    "stop", "cancel", "abort", "nevermind", "never mind",
+]
 
 
 class AgentLoop:
@@ -69,6 +80,9 @@ class AgentLoop:
         )
         
         self._running = False
+        self._processing = False  # True when actively processing a message
+        self._processing_description = ""  # What the agent is currently doing
+        self._busy_reply_timestamps: dict[str, float] = {}  # chat_key -> last busy reply time
         self._register_default_tools()
     
     def _register_default_tools(self) -> None:
@@ -107,36 +121,189 @@ class AgentLoop:
         self.tools.register(RestartTool())
     
     async def run(self) -> None:
-        """Run the agent loop, processing messages from the bus."""
+        """Run the agent loop, processing messages from the bus.
+        
+        Messages are processed as asyncio Tasks so the main loop can continue
+        monitoring the inbound queue. This enables:
+        - Immediate "busy" replies when the agent is working on something
+        - Task cancellation when the user sends a "stop/cancel" message
+        - Queuing of new messages for processing after the current one finishes
+        """
         self._running = True
         logger.info("Agent loop started")
         
+        current_task: asyncio.Task[None] | None = None
+        current_msg: InboundMessage | None = None
+        pending_queue: list[InboundMessage] = []
+        
         while self._running:
+            # --- Phase 1: If idle, pick next message and start processing ---
+            if current_task is None:
+                if pending_queue:
+                    next_msg = pending_queue.pop(0)
+                else:
+                    try:
+                        next_msg = await asyncio.wait_for(
+                            self.bus.consume_inbound(),
+                            timeout=1.0
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                
+                current_msg = next_msg
+                current_task = asyncio.create_task(
+                    self._safe_process(next_msg)
+                )
+                # Don't fall through — go back to top to enter Phase 2
+                continue
+            
+            # --- Phase 2: Task is running, monitor for new messages ---
             try:
-                # Wait for next message
                 msg = await asyncio.wait_for(
                     self.bus.consume_inbound(),
-                    timeout=1.0
+                    timeout=0.5
                 )
-                
-                # Process it
-                try:
-                    response = await self._process_message(msg)
-                    if response:
-                        await self.bus.publish_outbound(response)
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    # Send error response
-                    error_metadata = dict(msg.metadata or {})
-                    error_metadata["sender_id"] = msg.sender_id
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}",
-                        metadata=error_metadata
-                    ))
             except asyncio.TimeoutError:
+                # No new message; check if task finished
+                if current_task.done():
+                    self._collect_task(current_task)
+                    current_task = None
+                    current_msg = None
                 continue
+            
+            # Got a new message while busy
+            if msg.channel == "system":
+                # System messages (subagent results) just queue silently
+                pending_queue.append(msg)
+            elif self._is_cancel_intent(msg.content):
+                # User wants to cancel the current task!
+                logger.info(f"Cancel requested: '{msg.content}' — cancelling current task")
+                current_task.cancel()
+                try:
+                    await current_task
+                except asyncio.CancelledError:
+                    logger.info("Current task cancelled successfully")
+                
+                # Send cancellation confirmation
+                await self._send_cancel_reply(msg, current_msg)
+                
+                # Save to session so cancellation is in history
+                if current_msg and current_msg.channel != "system":
+                    session = self.sessions.get_or_create(current_msg.session_key)
+                    session.add_message("user", current_msg.content)
+                    session.add_message("assistant", "[任务已被用户取消]")
+                    self.sessions.save(session)
+                
+                current_task = None
+                current_msg = None
+            else:
+                # Regular message while busy — send busy reply, queue it
+                await self._send_busy_reply(msg)
+                pending_queue.append(msg)
+            
+            # Check if task finished while we were handling the new message
+            if current_task is not None and current_task.done():
+                self._collect_task(current_task)
+                current_task = None
+                current_msg = None
+    
+    def _collect_task(self, task: asyncio.Task[None]) -> None:
+        """Collect a finished task, logging any unexpected exceptions."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"Task raised unexpected exception: {exc}")
+    
+    async def _safe_process(self, msg: InboundMessage) -> None:
+        """Process a message with busy-state tracking and error handling.
+        
+        Supports cancellation via asyncio.CancelledError — the error propagates
+        up so the caller (run loop) can handle the cancel flow.
+        """
+        self._processing = True
+        self._processing_description = msg.content[:50] if msg.content else ""
+        try:
+            response = await self._process_message(msg)
+            if response:
+                await self.bus.publish_outbound(response)
+        except asyncio.CancelledError:
+            logger.info(f"Processing cancelled for: {self._processing_description}")
+            raise  # Re-raise so run() can handle it
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+            error_metadata = dict(msg.metadata or {})
+            error_metadata["sender_id"] = msg.sender_id
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Sorry, I encountered an error: {str(e)}",
+                metadata=error_metadata
+            ))
+        finally:
+            self._processing = False
+            self._processing_description = ""
+    
+    @staticmethod
+    def _is_cancel_intent(content: str) -> bool:
+        """Check if a message is a cancel/stop request.
+        
+        Only matches short messages to avoid false positives like
+        "请帮我查一下如何停止docker容器".
+        """
+        text = content.strip().lower()
+        if len(text) > 30:
+            return False
+        return any(kw in text for kw in _CANCEL_KEYWORDS)
+    
+    async def _send_cancel_reply(
+        self, cancel_msg: InboundMessage, cancelled_msg: InboundMessage | None
+    ) -> None:
+        """Send a confirmation that the current task was cancelled."""
+        what = ""
+        if cancelled_msg:
+            preview = cancelled_msg.content[:30]
+            if len(cancelled_msg.content) > 30:
+                preview += "..."
+            what = f"（{preview}）"
+        
+        text = f"好的，已停止上一个任务{what}"
+        
+        outbound_metadata = dict(cancel_msg.metadata or {})
+        outbound_metadata["sender_id"] = cancel_msg.sender_id
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=cancel_msg.channel,
+            chat_id=cancel_msg.chat_id,
+            content=text,
+            metadata=outbound_metadata,
+        ))
+    
+    async def _send_busy_reply(self, msg: InboundMessage) -> None:
+        """Send an immediate 'busy' reply when the agent is processing another message.
+        
+        Uses a cooldown to avoid spamming the user with repeated busy messages.
+        """
+        chat_key = f"{msg.channel}:{msg.chat_id}"
+        now = time.monotonic()
+        last_reply = self._busy_reply_timestamps.get(chat_key, 0)
+        
+        if now - last_reply < _BUSY_REPLY_COOLDOWN:
+            logger.debug(f"Busy reply cooldown active for {chat_key}, skipping")
+            return
+        
+        self._busy_reply_timestamps[chat_key] = now
+        
+        busy_text = "我正在处理上一条消息，稍等一下，处理完了马上回复你～"
+        
+        outbound_metadata = dict(msg.metadata or {})
+        outbound_metadata["sender_id"] = msg.sender_id
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=busy_text,
+            metadata=outbound_metadata,
+        ))
+        logger.info(f"Sent busy reply to {chat_key}")
     
     def stop(self) -> None:
         """Stop the agent loop."""
